@@ -2,9 +2,11 @@
 #include <cstdlib>
 #include <cassert>
 #include <cstring>
+
 #include <pico/stdlib.h>
 #include <hardware/exception.h>
 #include <hardware/structs/systick.h>
+
 #include "src/piko.hpp"
 
 constexpr uint8_t PERF_PIN = 2;
@@ -16,8 +18,8 @@ void task1() {
 
     while (true) {
         asm volatile("cpsid i");
-        uint64_t time = get_absolute_time();
-        printf("%f: Task 1 says hi!\n", (time - last_time) / 1e6);
+        uint64_t time = time_us_64();
+        // printf("%f: Task 1 says hi!\n", (time - last_time) / 1e6);
         last_time = time;
         asm volatile("cpsie i");
 
@@ -30,8 +32,8 @@ void task2() {
 
     while (true) {
         asm volatile("cpsid i");
-        uint64_t time = get_absolute_time();
-        printf("%f: Task 2 says hi!\n", (time - last_time) / 1e6);
+        uint64_t time = time_us_64();
+        // printf("%f: Task 2 says hi!\n", (time - last_time) / 1e6);
         last_time = time;
         asm volatile("cpsie i");
 
@@ -44,8 +46,8 @@ void task3() {
 
     while (true) {
         asm volatile("cpsid i");
-        uint64_t time = get_absolute_time();
-        printf("%f: Task 3 says hi!\n", (time - last_time) / 1e6);
+        uint64_t time = time_us_64();
+        // printf("%f: Task 3 says hi!\n", (time - last_time) / 1e6);
         last_time = time;
         asm volatile("cpsie i");
 
@@ -66,7 +68,7 @@ int main() {
     gpio_init(PERF_PIN);
     gpio_set_dir(PERF_PIN, GPIO_OUT);
 
-    auto& scheduler = piko::Scheduler::get_current();
+    auto& scheduler = piko::Scheduler::current();
 
     scheduler.add_task(task1, "task1");
     scheduler.add_task(task2, "task2");

@@ -3,7 +3,10 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+
 #include <hardware/exception.h>
+
+#include "sysview.hpp"
 
 namespace piko {
 
@@ -17,41 +20,43 @@ static uint32_t get_current_core();
 static Scheduler schedulers[CORE_COUNT] asm("schedulers");
 
 Scheduler::Scheduler() {
-    add_task(idle_task, "idle");
+    add_task(piko::Scheduler::idle_task, "idle");
 }
 
-void Scheduler::add_task(void (*func)(), std::string_view name)
-{
-  // ARM requires the stack to be 8-byte aligned on procedure entry. `malloc` returns addresses aligned to
-  // max_align_t which then needs to be 8 bytes or greater for the mentioend invariant to hold
-  static_assert(sizeof(max_align_t) >= 8, "max_align_t must be >= 8 for the task stack to be aligned properly");
+void Scheduler::add_task(void (*func)(), std::string_view name) {
+    // ARM requires the stack to be 8-byte aligned on procedure entry. `malloc` returns addresses aligned to
+    // max_align_t which then needs to be 8 bytes or greater for the mentioend invariant to hold
+    static_assert(sizeof(max_align_t) >= 8, "max_align_t must be >= 8 for the task stack to be aligned properly");
 
-  // TODO: Names don't work??
-  auto task = Task {
-    .sp = (uint32_t*)malloc(TASK_STACK_SIZE),
-    .name = name,
-    .sleep_ticks = 0
-  };
+    assert(name[name.size()] == '\0' && "Task name must be null-terminated");
 
-  // Initialize the stack to all zeros
-  memset(task.sp, 0, TASK_STACK_SIZE);
+    auto task = Task {
+        .sp = (uint32_t*) malloc(TASK_STACK_SIZE),
+        .name = name,
+        .sleep_ticks = 0
+    };
 
-  // The stack is full descending, so set the SP to the top of the stack
-  task.sp += TASK_STACK_SIZE / sizeof(uint32_t);
+    // Initialize the stack to all zeros
+    memset(task.sp, 0, TASK_STACK_SIZE);
 
-  // Now it gets a little fucky.. We construct a stack frame idential to the one during a
-  // task switch interrupt, including the automatically stacked exception frame
+    // The stack is full descending, so set the SP to the top of the stack
+    task.sp += TASK_STACK_SIZE / sizeof(uint32_t);
 
-  // First, make space for the stack frame
-  task.sp -= 16;
+    // Now it gets a little fucky.. We construct a stack frame idential to the one during a
+    // task switch interrupt, including the automatically stacked exception frame
 
-  task.sp[OFFSET_PC] = (uint32_t)func;
-  // Bit 24 of xPSR has to be set to indicate that we are in Thumb mode
-  task.sp[OFFSET_xPSR] = 1 << 24;
+    // First, make space for the stack frame
+    task.sp -= 16;
 
-  // TODO: Set LR to task return handler (tasks should never return)
+    task.sp[OFFSET_PC] = (uint32_t) func;
+    // Bit 24 of xPSR has to be set to indicate that we are in Thumb mode
+    task.sp[OFFSET_xPSR] = 1 << 24;
 
-  tasks[task_count++] = task;
+    // TODO: Set LR to task return handler (tasks should never return)
+
+    sysview::log_task_create(m_task_count);
+
+    m_tasks[m_task_count++] = task;
 }
 
 void Scheduler::start() {
@@ -59,6 +64,9 @@ void Scheduler::start() {
     if (hardware_alarm_is_claimed(ALARM_NUM)) {
         panic("Alarm %ld is claimed. What the fuck..\n", ALARM_NUM);
     }
+
+    sysview::init();
+    sysview::start();
 
     // Enable timer alarm interrupt
     hw_set_bits(&timer_hw->inte, 1 << ALARM_NUM);
@@ -69,67 +77,73 @@ void Scheduler::start() {
     // Arm the alarm by setting the target time
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + TASK_TICK_INTERVAL_US;
 
-    // piko cannot start if someone else is already using the PendSV interrupt
-    assert(exception_is_compile_time_default(exception_get_vtable_handler(PENDSV_EXCEPTION)) && "PendSV handler already set");
-
     exception_set_exclusive_handler(PENDSV_EXCEPTION, task_switch_isr);
 
-    // Then start the first task in the array
+    sysview::log_task_start(m_current_task);
+
+    // Then start the first non-idle task
     asm volatile(
         ".syntax unified\n"
 
-        // Load SP from the first task struct
-        "ldr r0, %[tasks]\n"
+        // Load SP from the first non-idle task struct
+        "ldr r0, %[task]\n"
         "mov sp, r0\n"
         // TODO: Task arguments
 
         // Load PC and jump to it
-        "ldr r0, [sp, %[offset_pc] * 4]\n"
+        "ldr r0, [sp, %[offset_pc]]\n"
         "bx r0\n"
-        :: [tasks] "m"(tasks), [offset_pc] "i"(OFFSET_PC)
+        :: [task] "m"(m_tasks[m_current_task]), [offset_pc] "i"(OFFSET_PC * 4)
         : "r0", "pc"
     );
 }
 
 void Scheduler::sleep(uint32_t ticks) {
-    assert(tasks[current_task].sleep_ticks == 0);
+    assert(m_tasks[m_current_task].sleep_ticks == 0);
 
-    tasks[current_task].sleep_ticks = ticks;
+    m_tasks[m_current_task].sleep_ticks = ticks;
 }
 
-Scheduler& Scheduler::get_current(){
+Scheduler& Scheduler::current() {
     return schedulers[get_current_core()];
 }
 
-Task& Scheduler::select_next_task()
-{
+Task& Scheduler::select_next_task() {
     bool task_found = false;
 
-    for (uint32_t i = 0; i < task_count; i++) {
-        current_task = current_task + 1;
+    for (uint32_t i = 0; i < m_task_count; i++) {
+        m_current_task = m_current_task + 1;
 
-        if (current_task >= task_count) {
-            current_task = 0;
+        if (m_current_task >= m_task_count) {
+            m_current_task = 0;
         }
 
-        if (tasks[current_task].sleep_ticks == 0 && current_task != IDLE_TASK_ID) {
+        if (m_tasks[m_current_task].sleep_ticks == 0 && m_current_task != IDLE_TASK_ID) {
             task_found = true;
             break;
         }
     }
 
     if (!task_found) {
-        current_task = IDLE_TASK_ID;
+        m_current_task = IDLE_TASK_ID;
+
+        sysview::log_task_idle();
+    } else {
+        sysview::log_task_start(m_current_task);
     }
 
-    return tasks[current_task];
+    return m_tasks[m_current_task];
+}
+
+std::span<Task> Scheduler::tasks() {
+    return { m_tasks, m_task_count };
 }
 
 void Scheduler::tick() {
     // Each tick decrement the number of sleep ticks for each task
-    for (uint32_t i = 0; i < task_count; i++) {
-        if (tasks[i].sleep_ticks > 0) {
-            tasks[i].sleep_ticks -= 1;
+    for (uint32_t i = 0; i < m_task_count; i++) {
+        if (m_tasks[i].sleep_ticks > 0) {
+            m_tasks[i].sleep_ticks -= 1;
         }
     }
 }
@@ -147,17 +161,17 @@ void Scheduler::alarm_isr() {
     // Rearm the alarm to keep going
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + TASK_TICK_INTERVAL_US;
 
-    Scheduler::get_current().tick();
+    Scheduler::current().tick();
 
     // Trigger a PendSV interrupt
     hw_set_bits(&scb_hw->icsr, M0PLUS_ICSR_PENDSVSET_BITS);
 }
 
-__attribute__((naked)) void Scheduler::task_switch_isr() {
+void Scheduler::task_switch_isr() {
     // The assembly code below assumes these are true
     static_assert(sizeof(Task) <= 255); // ...because mov only works with imm8
     static_assert(sizeof(Scheduler) <= 255); // ...because mov only works with imm8
-    static_assert(offsetof(Scheduler, tasks) == 0); // ...because we assume tasks are the first field
+    static_assert(offsetof(Scheduler, m_tasks) == 0); // ...because we assume tasks are the first field
     static_assert(offsetof(Task, sp) == 0); // ...and because we assume SP is the first field
 
     // First, save all registers in their current state by pushing them onto the current task's stack
@@ -196,7 +210,7 @@ __attribute__((naked)) void Scheduler::task_switch_isr() {
         // Finally, save the SP into the first field of the struct
         "mov r1, sp\n"
         "str r1, [r0]\n"
-        :: [SCHEDULER_STRUCT_SIZE] "i"(sizeof(Scheduler)), [TASK_STRUCT_SIZE] "i"(sizeof(Task)), [CURRENT_TASK_OFFSET] "i"(offsetof(Scheduler, current_task))
+        :: [SCHEDULER_STRUCT_SIZE] "i"(sizeof(Scheduler)), [TASK_STRUCT_SIZE] "i"(sizeof(Task)), [CURRENT_TASK_OFFSET] "i"(offsetof(Scheduler, m_current_task))
         : "r0", "r1", "r2", "r3", "r4", /* "sp", */ "memory"
     );
 
@@ -223,11 +237,13 @@ __attribute__((naked)) void Scheduler::task_switch_isr() {
     // Clear the PendSV interrupt
     hw_set_bits(&scb_hw->icsr, M0PLUS_ICSR_PENDSVCLR_BITS);
 
+    sysview::log_task_stop();
+
     asm volatile(
         ".syntax unified\n"
 
         // Load SP from the current task struct
-        "ldr r0, [%[current_task_ptr]]\n"
+        "ldr r0, %[current_task_ptr]\n"
         "mov sp, r0\n"
 
         "pop {r0-r3}\n"
@@ -241,7 +257,7 @@ __attribute__((naked)) void Scheduler::task_switch_isr() {
         // 0xFFFFFFF9 is a magic return address which will execute the exception return routine and return to Thread_Mode with MSP
         "ldr r0, =0xFFFFFFF9\n"
         "bx r0\n"
-        :: [current_task_ptr] "r"(&Scheduler::get_current().select_next_task())
+        :: [current_task_ptr] "m"(Scheduler::current().select_next_task())
     );
 
     // Define the used data words

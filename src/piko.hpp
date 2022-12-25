@@ -1,8 +1,10 @@
 #pragma once
 
-#include <cstdint>
 #include <string_view>
-#include <stdio.h>
+#include <span>
+#include <cstdint>
+#include <cstdio>
+
 #include <pico/stdlib.h>
 #include <hardware/structs/scb.h>
 
@@ -17,6 +19,8 @@ constexpr uint32_t CORE_COUNT = 2;
 
 constexpr uint32_t ALARM_NUM = 0;
 constexpr uint32_t ALARM_IRQ = TIMER_IRQ_0 + ALARM_NUM;
+
+#define PIKO_SYSVIEW_LOGGING_ENABLED false
 // -- Config --
 
 struct Task {
@@ -27,12 +31,16 @@ struct Task {
 
 class Scheduler {
 private:
-    Task tasks[TASK_CAPACITY];
-    uint32_t task_count = 0;
-    uint32_t current_task = 0;
+    Task m_tasks[TASK_CAPACITY];
+    uint32_t m_task_count = 0;
+    uint32_t m_current_task = 1; // Task 0 is the idle task, skip that one
 
 public:
     Scheduler();
+
+    /// @brief Get the scheduler for the current executing core. There is one scheduler per core
+    /// @return The scheduler for the current core
+    static Scheduler& current();
 
     /// @brief Add a task to the task scheduler
     /// @param func The task function
@@ -51,22 +59,20 @@ public:
         hw_set_bits(&scb_hw->icsr, M0PLUS_ICSR_PENDSVSET_BITS);
     }
 
-    /// @brief Get the scheduler for the current executing core. There is one scheduler per core
-    /// @return The scheduler for the current core
-    static Scheduler& get_current();
+    std::span<Task> tasks();
+
 private:
+    void tick();
     Task& select_next_task();
 
-    void tick();
+    static void alarm_isr();
+    __attribute__((naked)) static void task_switch_isr();
 
     static void idle_task();
-
-    static void alarm_isr();
-    static void task_switch_isr();
 };
 
 __attribute__((always_inline)) inline void sleep(uint32_t ticks) {
-    auto& scheduler = Scheduler::get_current();
+    auto& scheduler = Scheduler::current();
     // - 1 is a hack to account for the time yield takes to run
     scheduler.sleep(ticks - 1);
     scheduler.yield();
